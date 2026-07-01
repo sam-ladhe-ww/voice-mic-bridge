@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<!--
+  mic-bridge.html — HOSTED OUTSIDE Apps Script (e.g. GitHub Pages).
+
+  Why it exists: Apps Script serves its web app inside a sandboxed iframe that
+  blocks getUserMedia. This page runs as a normal top-level popup window (full
+  mic permission), does speech-to-text with the browser's Web Speech API, and
+  streams transcripts back to the opener via postMessage. The opener passes a
+  one-time ?token= (echoed back) and its ?parent= origin (postMessage target).
+
+  Deploy: put this file on any static HTTPS host, then set MIC_BRIDGE_URL in the
+  Apps Script project's Script Properties to its URL. No secrets live here.
+-->
+<html>
+<head><meta charset="utf-8"><title>Microphone</title>
+<style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:16px;color:#1c1c1e}
+.dot{width:12px;height:12px;border-radius:50%;background:#c7c7cc;display:inline-block;margin-right:8px}
+.dot.on{background:#34c759}.dot.err{background:#ff3b30}</style>
+</head>
+<body>
+  <p><span class="dot" id="dot"></span><span id="status">Requesting microphone…</span></p>
+  <p style="color:#6b6b70;font-size:12px">Keep this window open during the call. It captures your speech for the intake.</p>
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var PARENT = params.get('parent') || '*';
+  var TOKEN = params.get('token') || '';
+  var listening = false, rec = null, shouldClose = false;
+
+  function post(msg) { msg.token = TOKEN; try { (window.opener || window.parent).postMessage(msg, PARENT); } catch (e) {} }
+  function setStatus(txt, cls) { document.getElementById('status').textContent = txt; document.getElementById('dot').className = 'dot' + (cls ? ' ' + cls : ''); }
+
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus('Speech recognition not supported in this browser (use Chrome).', 'err'); post({ type: 'error', message: 'SpeechRecognition unsupported' }); return; }
+
+  // Prompt for mic permission, confirm, then hand off to SpeechRecognition.
+  (navigator.mediaDevices ? navigator.mediaDevices.getUserMedia({ audio: true }) : Promise.reject(new Error('no mediaDevices')))
+    .then(function (stream) {
+      stream.getTracks().forEach(function (t) { t.stop(); });   // SpeechRecognition manages its own capture
+      buildRecognizer();
+      setStatus('Microphone ready. Waiting for the call…');
+      post({ type: 'ready' });
+    })
+    .catch(function (e) {
+      setStatus('Microphone blocked. You can still type answers in the call window.', 'err');
+      post({ type: 'error', message: 'getUserMedia: ' + (e && e.message || e) });
+    });
+
+  function buildRecognizer() {
+    rec = new SR();
+    rec.continuous = true; rec.interimResults = true; rec.lang = 'en-US';
+    rec.onresult = function (ev) {
+      var interim = '', finalText = '';
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var r = ev.results[i];
+        if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
+      }
+      if (interim) post({ type: 'interim', text: interim });
+      if (finalText.trim()) post({ type: 'final', text: finalText.trim() });
+    };
+    rec.onerror = function (ev) {
+      if (ev.error === 'no-speech' || ev.error === 'aborted') return;   // transient
+      post({ type: 'error', message: 'recognition: ' + ev.error });
+    };
+    rec.onend = function () { if (listening && !shouldClose) { try { rec.start(); } catch (e) {} } };  // Chrome auto-stops; restart
+  }
+
+  function startListening() { if (!rec) return; listening = true; setStatus('Listening…', 'on'); try { rec.start(); } catch (e) {} }
+  function stopListening() { listening = false; setStatus('Paused (Alex is speaking)…'); try { if (rec) rec.stop(); } catch (e) {} }
+
+  window.addEventListener('message', function (ev) {
+    if (PARENT !== '*' && ev.origin !== PARENT) return;
+    var d = ev.data || {};
+    if (d.type === 'resume') startListening();
+    else if (d.type === 'pause') stopListening();
+    else if (d.type === 'stop') { shouldClose = true; stopListening(); setTimeout(function () { window.close(); }, 150); }
+  });
+
+  window.addEventListener('beforeunload', function () { post({ type: 'error', message: 'mic window closed' }); });
+})();
+</script>
+</body>
+</html>
