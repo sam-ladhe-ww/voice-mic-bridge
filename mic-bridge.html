@@ -36,8 +36,12 @@
   // VAD tuning (overridable via ?vadRms= & ?vadFrames=): RMS threshold + consecutive frames (~40ms each).
   var VAD_RMS = parseFloat(params.get('vadRms')) || 0.055;
   var VAD_FRAMES = parseInt(params.get('vadFrames'), 10) || 5;
+  // End-of-turn grace: after a final result, wait this long for more speech before submitting, so a
+  // brief mid-thought pause doesn't cut the user off and fragmented finals merge into one turn.
+  var ENDPOINT_MS = parseInt(params.get('endpointMs'), 10); if (isNaN(ENDPOINT_MS)) ENDPOINT_MS = 600;
 
   var listening = false, rec = null, shouldClose = false;
+  var pendingFinal = '', endpointTimer = null;
   var micStream = null, audioCtx = null, analyser = null, vadBuf = null, vadRAF = null;
   var watching = false, hotFrames = 0;   // barge watch state (only during 'agentspeaking')
 
@@ -100,8 +104,10 @@
         var r = ev.results[i];
         if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
       }
-      if (interim) post({ type: 'interim', text: interim });
-      if (finalText.trim()) post({ type: 'final', text: finalText.trim() });
+      if (finalText.trim()) pendingFinal = (pendingFinal ? pendingFinal + ' ' : '') + finalText.trim();
+      var live = (pendingFinal + ' ' + interim).trim();          // caption = committed so far + what's being said
+      if (live) post({ type: 'interim', text: live });
+      if (pendingFinal) scheduleEndpoint();                       // hold; continued speech keeps pushing this out
     };
     rec.onerror = function (ev) {
       if (ev.error === 'no-speech' || ev.error === 'aborted') return;   // transient
@@ -110,8 +116,16 @@
     rec.onend = function () { if (listening && !shouldClose) { try { rec.start(); } catch (e) {} } };  // Chrome auto-stops; restart
   }
 
+  function scheduleEndpoint() { clearTimeout(endpointTimer); endpointTimer = setTimeout(flushFinal, ENDPOINT_MS); }
+  function resetEndpoint() { clearTimeout(endpointTimer); endpointTimer = null; pendingFinal = ''; }
+  function flushFinal() {
+    endpointTimer = null;
+    var t = pendingFinal.trim(); pendingFinal = '';
+    if (t && listening) post({ type: 'final', text: t });   // one merged end-of-turn utterance
+  }
+
   function startListening() { if (!rec) return; watching = false; listening = true; setStatus('Listening…', 'on'); try { rec.start(); } catch (e) {} }
-  function stopListening() { listening = false; try { if (rec) rec.stop(); } catch (e) {} }
+  function stopListening() { listening = false; resetEndpoint(); try { if (rec) rec.stop(); } catch (e) {} }
 
   // Agent is speaking: stop transcribing (avoid echoing the agent) but watch for the user barging in.
   function watchForBarge() {
