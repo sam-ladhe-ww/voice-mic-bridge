@@ -8,6 +8,14 @@
   streams transcripts back to the opener via postMessage. The opener passes a
   one-time ?token= (echoed back) and its ?parent= origin (postMessage target).
 
+  Barge-in: while the agent is speaking the opener sends {type:'agentspeaking'}.
+  We keep SpeechRecognition OFF (so we don't transcribe the agent's own voice)
+  but run a lightweight WebAudio VAD on an echo-cancelled mic stream; when the
+  user starts talking we post {type:'barge'} and switch recognition on to catch
+  the interruption. NOTE: acoustic echo cancellation only reliably suppresses
+  the agent's voice when the user is on HEADPHONES — on open speakers the agent's
+  audio can bleed into the mic and trip a false barge. Headphones recommended.
+
   Deploy: put this file on any static HTTPS host, then set MIC_BRIDGE_URL in the
   Apps Script project's Script Properties to its URL. No secrets live here.
 -->
@@ -15,17 +23,23 @@
 <head><meta charset="utf-8"><title>Microphone</title>
 <style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:16px;color:#1c1c1e}
 .dot{width:12px;height:12px;border-radius:50%;background:#c7c7cc;display:inline-block;margin-right:8px}
-.dot.on{background:#34c759}.dot.err{background:#ff3b30}</style>
+.dot.on{background:#34c759}.dot.err{background:#ff3b30}.dot.listen{background:#ff9f0a}</style>
 </head>
 <body>
   <p><span class="dot" id="dot"></span><span id="status">Requesting microphone…</span></p>
-  <p style="color:#6b6b70;font-size:12px">Keep this window open during the call. It captures your speech for the intake.</p>
+  <p style="color:#6b6b70;font-size:12px">Keep this window open during the call. It captures your speech for the intake. For barge-in (talking over the agent), headphones are recommended.</p>
 <script>
 (function () {
   var params = new URLSearchParams(location.search);
   var PARENT = params.get('parent') || '*';
   var TOKEN = params.get('token') || '';
+  // VAD tuning (overridable via ?vadRms= & ?vadFrames=): RMS threshold + consecutive frames (~40ms each).
+  var VAD_RMS = parseFloat(params.get('vadRms')) || 0.055;
+  var VAD_FRAMES = parseInt(params.get('vadFrames'), 10) || 5;
+
   var listening = false, rec = null, shouldClose = false;
+  var micStream = null, audioCtx = null, analyser = null, vadBuf = null, vadRAF = null;
+  var watching = false, hotFrames = 0;   // barge watch state (only during 'agentspeaking')
 
   function post(msg) { msg.token = TOKEN; try { (window.opener || window.parent).postMessage(msg, PARENT); } catch (e) {} }
   function setStatus(txt, cls) { document.getElementById('status').textContent = txt; document.getElementById('dot').className = 'dot' + (cls ? ' ' + cls : ''); }
@@ -33,10 +47,13 @@
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { setStatus('Speech recognition not supported in this browser (use Chrome).', 'err'); post({ type: 'error', message: 'SpeechRecognition unsupported' }); return; }
 
-  // Prompt for mic permission, confirm, then hand off to SpeechRecognition.
-  (navigator.mediaDevices ? navigator.mediaDevices.getUserMedia({ audio: true }) : Promise.reject(new Error('no mediaDevices')))
+  // Prompt for mic permission with echo cancellation on (helps barge-in on headphones), then
+  // keep the stream alive to power the VAD. SpeechRecognition uses its own capture on top.
+  var constraints = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+  (navigator.mediaDevices ? navigator.mediaDevices.getUserMedia(constraints) : Promise.reject(new Error('no mediaDevices')))
     .then(function (stream) {
-      stream.getTracks().forEach(function (t) { t.stop(); });   // SpeechRecognition manages its own capture
+      micStream = stream;
+      setupVad(stream);
       buildRecognizer();
       setStatus('Microphone ready. Waiting for the call…');
       post({ type: 'ready' });
@@ -45,6 +62,34 @@
       setStatus('Microphone blocked. You can still type answers in the call window.', 'err');
       post({ type: 'error', message: 'getUserMedia: ' + (e && e.message || e) });
     });
+
+  // ---- VAD: RMS on the mic stream; used only to detect a barge while the agent speaks ----
+  function setupVad(stream) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var src = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 512;
+      src.connect(analyser);
+      vadBuf = new Uint8Array(analyser.frequencyBinCount);
+      var tick = function () {
+        vadRAF = requestAnimationFrame(tick);
+        if (!watching || !analyser) return;
+        analyser.getByteTimeDomainData(vadBuf);
+        var sum = 0;
+        for (var i = 0; i < vadBuf.length; i++) { var v = (vadBuf[i] - 128) / 128; sum += v * v; }
+        var rms = Math.sqrt(sum / vadBuf.length);
+        if (rms > VAD_RMS) { if (++hotFrames >= VAD_FRAMES) onBarge(); }
+        else { hotFrames = 0; }
+      };
+      tick();
+    } catch (e) { /* VAD is best-effort; barge-in just won't fire without it */ }
+  }
+
+  function onBarge() {
+    watching = false; hotFrames = 0;
+    post({ type: 'barge' });
+    startListening();   // capture what the user is saying over the agent
+  }
 
   function buildRecognizer() {
     rec = new SR();
@@ -65,15 +110,24 @@
     rec.onend = function () { if (listening && !shouldClose) { try { rec.start(); } catch (e) {} } };  // Chrome auto-stops; restart
   }
 
-  function startListening() { if (!rec) return; listening = true; setStatus('Listening…', 'on'); try { rec.start(); } catch (e) {} }
-  function stopListening() { listening = false; setStatus('Paused (Alex is speaking)…'); try { if (rec) rec.stop(); } catch (e) {} }
+  function startListening() { if (!rec) return; watching = false; listening = true; setStatus('Listening…', 'on'); try { rec.start(); } catch (e) {} }
+  function stopListening() { listening = false; try { if (rec) rec.stop(); } catch (e) {} }
+
+  // Agent is speaking: stop transcribing (avoid echoing the agent) but watch for the user barging in.
+  function watchForBarge() {
+    stopListening();
+    hotFrames = 0; watching = true;
+    if (audioCtx && audioCtx.resume) { try { audioCtx.resume(); } catch (e) {} }
+    setStatus('Alex is speaking — talk to interrupt…', 'listen');
+  }
 
   window.addEventListener('message', function (ev) {
     if (PARENT !== '*' && ev.origin !== PARENT) return;
     var d = ev.data || {};
     if (d.type === 'resume') startListening();
-    else if (d.type === 'pause') stopListening();
-    else if (d.type === 'stop') { shouldClose = true; stopListening(); setTimeout(function () { window.close(); }, 150); }
+    else if (d.type === 'agentspeaking') watchForBarge();
+    else if (d.type === 'pause') { watching = false; stopListening(); setStatus('Paused…'); }
+    else if (d.type === 'stop') { shouldClose = true; watching = false; stopListening(); try { if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} setTimeout(function () { window.close(); }, 150); }
   });
 
   window.addEventListener('beforeunload', function () { post({ type: 'error', message: 'mic window closed' }); });
